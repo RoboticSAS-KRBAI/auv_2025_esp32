@@ -1,340 +1,496 @@
-#include <SPI.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <Adafruit_INA219.h>
-
-#define SCREEN_WIDTH 128 // display display width, in pixels
-#define SCREEN_HEIGHT 64 // display display height, in pixels
-
-// Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
-// The pins for I2C are defined by the Wire-library. 
-// On an arduino UNO:       A4(SDA), A5(SCL)
-// On an arduino MEGA 2560: 20(SDA), 21(SCL)
-// On an arduino LEONARDO:   2(SDA),  3(SCL), ...
-#define display_RESET     -1 // Reset pin # (or -1 if sharing Arduino reset pin)
-#define SCREEN_ADDRESS 0x3C ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, display_RESET);
-Adafruit_INA219 ina219;
-
-/////////////////////
-/// For Micro ROS ///
-/////////////////////
-#include <Arduino.h>
-#include <micro_ros_platformio.h>
-#include <stdio.h>
-#include <rcl/rcl.h>
-#include <rcl/error_handling.h>
-#include <rclc/rclc.h>
-#include <rclc/executor.h>
-#include <rmw_microros/rmw_microros.h>
-
-// Message headers
-#include <std_msgs/msg/string.h>
-#include <auv_interfaces/msg/object_difference.h>
-#include <auv_interfaces/msg/sensor.h>
-
 /*
- * Helper functions to help reconnect
-*/
-#define EXECUTE_EVERY_N_MS(MS, X)  do { \
-    static volatile int64_t init = -1; \
-    if (init == -1) { init = uxr_millis();} \
-    if (uxr_millis() - init > MS) { X; init = uxr_millis();} \
-  } while (0)
+ * Multi-Sensor ESP32-S3 - Fixed HIDS Reading (2s Interval)
+ * SDA: GPIO 18 | SCL: GPIO 17
+ * - WSEN-PADS (Pressure) - 0x5D
+ * - WSEN-HIDS (Temp/Humidity) - 0x44 [FIXED]
+ * - INA226 #1 (Power) - 0x45
+ * - INA226 #2 (Power) - 0x41
+ */
 
-enum states {
-  WAITING_AGENT,
-  AGENT_AVAILABLE,
-  AGENT_CONNECTED,
-  AGENT_DISCONNECTED
-} state;
+#include <Wire.h>
+#include <INA226.h>
 
-// Declare rcl object
-rclc_support_t support;
-rcl_init_options_t init_options;
-rcl_node_t node;
-rcl_timer_t timer;
-rclc_executor_t executor;
-rcl_allocator_t allocator;
+// Pin Configuration
+#define SDA_PIN 18
+#define SCL_PIN 17
 
-// Declare Publishers
-rcl_publisher_t pub_pwm, pub_error, pub_sensor, pub_set_point, pub_pid, pub_status, pub_boost;
+// WSEN-PADS Configuration
+#define PADS_ADDRESS 0x5D
+#define PADS_DEVICE_ID_REG 0x0F
+#define PADS_CTRL_1_REG 0x10
+#define PADS_CTRL_2_REG 0x11
+#define PADS_STATUS_REG 0x27
+#define PADS_DATA_P_XL_REG 0x28
+#define PADS_DATA_T_L_REG 0x2B
+#define PADS_DEVICE_ID_VALUE 0xB3
 
-// Declare Subscribers
-rcl_subscription_t sub_status, sub_sensor, sub_object_difference;
+// WSEN-HIDS Configuration
+#define HIDS_ADDRESS 0x44
+#define HIDS_MEASURE_HPM 0xFD
+#define HIDS_SOFT_RESET 0x94
+#define HIDS_MEASURE_SERIAL_NUMBER 0x89
+#define HIDS_MEASURE_DELAY_HPM 20  // Increased from 15 to 20ms for reliability
+#define CRC8_POLYNOMIAL 0x31
+#define CRC8_INIT 0xFF
 
-// Declare Messages
-std_msgs__msg__String status_msg;
-auv_interfaces__msg__ObjectDifference object_difference_msg;
-auv_interfaces__msg__Sensor sensor_msg;
+// INA226 Configuration
+#define INA1_ADDR 0x45
+#define INA2_ADDR 0x41
 
-// Variable sensor and logic
-float yaw = 0.0, busVoltage = 0.0;
-String Status = "stop", Object_type = "None", prevStatus = "", prevObjectDiff = "";
-unsigned long lastSensorUpdate = 0;
-const unsigned long sensorUpdateInterval = 100;
+// Display Configuration
+#define DISPLAY_WITH_LABELS true
+#define UPDATE_INTERVAL 2000
+#define I2C_TIMEOUT 100
+#define SERIAL_BUFFER_SIZE 512
 
+INA226 ina1(INA1_ADDR, &Wire);
+INA226 ina2(INA2_ADDR, &Wire);
 
-// Callback functions
-bool receive_status = false;
-void status_callback(const void *msgin) {
-  const std_msgs__msg__String *status_msg = (const std_msgs__msg__String *)msgin;
-  
-  // receive message
-  String received_status = String(status_msg->data.data);
-  Status = received_status;  // Menyimpan data status yang diterima
-  receive_status = true;
-}
+// Timing variables for HIDS
+unsigned long hidsStartTime = 0;
+bool hidsWaiting = false;
+bool hidsDataValid = false;
 
-void object_difference_callback(const void *msgin) {
-  const auv_interfaces__msg__ObjectDifference *object_difference_msg = (const auv_interfaces__msg__ObjectDifference *)msgin;
-  
-  Object_type = object_difference_msg->object_type.data;
-}
+unsigned long lastDisplayTime = 0;
 
-void timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
-  (void) last_call_time;
-  if (timer != NULL) {
-    
-    if(receive_status) {
-      // Publish
-      rcl_publish(&pub_status, &status_msg, NULL);
+// Sensor data structure with mutex protection
+struct SensorData {
+  float pressure;
+  float tempHIDS;
+  float tempPADS;
+  float tempFusion;
+  float humidity;
+  float voltage1;
+  float current1;
+  float power1;
+  float voltage2;
+  float current2;
+  float power2;
+  unsigned long timestamp;
+  bool dataReady;
+  bool hidsValid;  // Flag untuk validasi HIDS
+} sensorData;
 
-      receive_status = false;
-    }
+// Mutex for thread-safe data access
+SemaphoreHandle_t dataMutex;
+TaskHandle_t sensorTaskHandle = NULL;
 
-    // if (Status != prevStatus) {
-    //   display.setTextSize(1);
-    //   display.setCursor(0, 0);
-    //   display.print("                ");
-    //   display.setCursor(0, 0);
-    //   display.print("S: "); display.print(Status);
-    //   prevStatus = Status;
-    //   display.display();
-    // }
+// Function Prototypes
+uint8_t PADS_readRegister(uint8_t reg);
+void PADS_writeRegister(uint8_t reg, uint8_t value);
+int32_t PADS_readPressure();
+int16_t PADS_readTemperature();
+bool PADS_init();
 
-  }
-}
+uint8_t calculateCRC8(uint8_t *data, uint8_t len);
+bool verifyCRC8(uint8_t *data, uint8_t len, uint8_t crc);
+bool HIDS_sendCommand(uint8_t command);
+bool HIDS_readData(uint8_t *data, uint8_t len);
+bool HIDS_init();
+bool HIDS_softReset();
+bool HIDS_readSerialNumber(uint32_t *serialNumber);
+bool HIDS_measureBlocking(float *temperature, float *humidity);  // Changed to blocking
 
-// Micro-ROS functions
-bool create_entities() {
-  const char * node_name = "teensy_node";
-  const char * ns = "";
-  const int domain_id = 0;
-
-  // Initialize node
-
-  allocator = rcl_get_default_allocator();
-  init_options = rcl_get_zero_initialized_init_options();
-  rcl_init_options_init(&init_options, allocator);
-  rcl_init_options_set_domain_id(&init_options, domain_id);
-  rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator);
-  rclc_node_init_default(&node, node_name, ns, &support);
-
-  // Initialize publishers
-    rclc_publisher_init(
-        &pub_status,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
-        "status_msg", &rmw_qos_profile_default);
-
-    // Initialize subscribers
-    rclc_subscription_init(
-        &sub_status,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
-        "status", &rmw_qos_profile_default);
-    
-    // rclc_subscription_init(
-    //     &sub_sensor,
-    //     &node,
-    //     ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
-    //     "sensor", &rmw_qos_profile_default);
-    
-    // rclc_subscription_init(
-    //     &sub_object_difference,
-    //     &node,
-    //     ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
-    //     "object_different", &rmw_qos_profile_default);
-
-    /*
-   * Init timer_callback
-   * TODO : change timer_timeout
-   * 50ms : 20Hz
-   * 20ms : 50Hz
-   * 10ms : 100Hz
-   */
-  const unsigned int timer_timeout = 50;
-  rclc_timer_init_default(&timer,&support, RCL_MS_TO_NS(timer_timeout), timer_callback);
-
-  /*
-   * Init Executor
-   * TODO : make sure the num_handles is correct
-   * num_handles = total_of_subscriber + timer
-   * publisher is not counted
-   * 
-   * TODO : make sure the name of sub msg and callback are correct
-   */
-  unsigned int num_handles = 4;
-  executor = rclc_executor_get_zero_initialized_executor();
-  rclc_executor_init(&executor, &support.context, num_handles, &allocator);
-  rclc_executor_add_subscription(&executor, &sub_status, &status_msg, &status_callback, ON_NEW_DATA);
-  // rclc_executor_add_subscription(&executor, &sub_sensor, &sensor_msg, &status_callback, ON_NEW_DATA);
-  // rclc_executor_add_subscription(&executor, &sub_object_difference, &object_difference_msg, &status_callback, ON_NEW_DATA);
-  rclc_executor_add_timer(&executor, &timer);
-
-  return true;
-}
-
-void destroy_entities() {
-  rmw_context_t * rmw_context = rcl_context_get_rmw_context(&support.context);
-  (void) rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
-
-  // Clean up all the created objects
-  rcl_timer_fini(&timer);
-  rclc_executor_fini(&executor);
-  rcl_init_options_fini(&init_options);
-  rcl_node_fini(&node);
-  rclc_support_fini(&support);
-
-  // Destroy publishers
-  rcl_publisher_fini(&pub_status, &node);
-
-  // Destroy subscribers
-  rcl_subscription_fini(&sub_status, &node);
-  // rcl_subscription_fini(&sub_sensor, &node);
-  // rcl_subscription_fini(&sub_object_difference, &node);
-}
-
+// Task functions
+void sensorReadTask(void *parameter);
+void displaySensorData();
 
 void setup() {
-  // Initialize serial communication
   Serial.begin(115200);
-  Wire.begin();
-  set_microros_serial_transports(Serial);
-
-
-  // Initialize messages
-  std_msgs__msg__String__init(&status_msg);
-  // auv_interfaces__msg__Sensor__init(&sensor_msg);
-  // auv_interfaces__msg__ObjectDifference__init(&object_difference_msg);
-
-  status_msg.data.data = (char*) malloc(50);
-  status_msg.data.capacity = 50;
-  status_msg.data.size = 0;
-
-  // if (!ina219.begin()) {
-  //   Serial.println("INA219 ERROR");
-  //   display.println("INA219 ERROR");
-  //   // while (1);
-  // }
-
-  // ina219.setCalibration_32V_1A();
+  Serial.setTxBufferSize(SERIAL_BUFFER_SIZE);
+  delay(1000);
   
-  // Initialize state
-  state = WAITING_AGENT;
-  Serial.println("Setup completed");
-}
-
-void run_control_loop() {
-  static unsigned long last_display = 0;
-  if (millis() - last_display > 100) {
-    if (Status != prevStatus) {
-      display.setTextSize(1);
-      display.setCursor(0, 0);
-      display.print("                ");
-      display.setCursor(0, 0);
-      display.print("S: "); display.print(Status);
-      prevStatus = Status;
-      display.display();
-      last_display = millis();
+  Serial.println(F("\n╔════════════════════════════════════════╗"));
+  Serial.println(F("║  Multi-Sensor ESP32-S3 (HIDS Fixed)   ║"));
+  Serial.println(F("╚════════════════════════════════════════╝"));
+  
+  // Initialize I2C with timeout
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);  // Reduced to 100kHz for better stability
+  Wire.setTimeOut(I2C_TIMEOUT);
+  delay(100);
+  
+  // Create mutex
+  dataMutex = xSemaphoreCreateMutex();
+  
+  // Initialize WSEN-PADS
+  Serial.print(F("[PADS] "));
+  Serial.println(PADS_init() ? F("✓ OK") : F("✗ FAIL"));
+  
+  // Initialize WSEN-HIDS
+  Serial.print(F("[HIDS] "));
+  if (HIDS_init()) {
+    Serial.print(F("✓ OK | SN: 0x"));
+    uint32_t serialNo = 0;
+    if (HIDS_readSerialNumber(&serialNo)) {
+      Serial.println(serialNo, HEX);
+    } else {
+      Serial.println();
     }
+  } else {
+    Serial.println(F("✗ FAIL"));
   }
-
-
-  // unsigned long now = millis();
-
-  // if (now - lastSensorUpdate >= sensorUpdateInterval) {
-  //   lastSensorUpdate = now;
-
-  //   // Ambil data dari INA219
-  //   float shuntVoltage = ina219.getShuntVoltage_mV();
-  //   busVoltage = ina219.getBusVoltage_V();
-  //   float current_mA = ina219.getCurrent_mA();
-  //   float power_mW = ina219.getPower_mW();
-  //   float loadVoltage = busVoltage + (shuntVoltage / 1000);
-
-  //   // Tampilkan hanya Bus Voltage, Suhu, dan Yaw di display
-  //   display.setCursor(0, 0);
-  //   display.setTextSize(1);
-  //   display.setTextColor(SSD1306_WHITE);
-  //   display.print("V: "); display.print(busVoltage, 2); display.println("V");
-  //   display.print("Y: "); display.println(yaw, 2);
-  //   display.display();
-  // }
-
-  // if (Status != prevStatus) {
-  //   display.setTextSize(1);
-  //   display.setCursor(0, 0);
-  //   display.print("                ");
-  //   display.setCursor(0, 0);
-  //   display.print("S: "); display.print(Status);
-  //   prevStatus = Status;
-  //   display.display();
-  // }
-
-  // if (Object_type != prevObjectDiff) {
-  //   display.setTextSize(1);
-  //   display.setCursor(0, 32);
-  //   display.print("                ");
-  //   display.setCursor(0, 32);
-
-  //   if(Object_type == "Orange_Flare") {
-  //     display.print("O: "); display.println("OF");
-  //   } else if(Object_type == "Red_Flare") {
-  //     display.print("O: "); display.println("RF");
-  //   } else if(Object_type == "Blue_Flare") {
-  //     display.print("O: "); display.println("BF");
-  //   } else if(Object_type == "Yellow_Flare") {
-  //     display.print("O: "); display.println("YF");
-  //   } else {
-  //     display.print("O: "); display.println(Object_type);
-  //   }
-
-  //   prevObjectDiff = Object_type;
-  //   display.display();
-  // }
+  
+  // Initialize INA226 #1
+  Serial.print(F("[INA1] "));
+  if (ina1.begin()) {
+    ina1.setAverage(16);
+    ina1.setMaxCurrentShunt(20.0, 0.001);
+    Serial.println(F("✓ OK"));
+  } else {
+    Serial.println(F("✗ FAIL"));
+  }
+  
+  // Initialize INA226 #2
+  Serial.print(F("[INA2] "));
+  if (ina2.begin()) {
+    ina2.setAverage(16);
+    ina2.setMaxCurrentShunt(20.0, 0.001);
+    Serial.println(F("✓ OK"));
+  } else {
+    Serial.println(F("✗ FAIL"));
+  }
+  
+  Serial.println(F("\n════════════ SYSTEM READY ════════════"));
+  Serial.println(F("Transmitting every 2 seconds...\n"));
+  
+  // Initialize sensor data
+  sensorData.dataReady = false;
+  sensorData.hidsValid = false;
+  
+  // Create sensor reading task on Core 0
+  xTaskCreatePinnedToCore(
+    sensorReadTask,
+    "SensorRead",
+    8192,
+    NULL,
+    2,
+    &sensorTaskHandle,
+    0  // Core 0
+  );
+  
+  delay(500);
 }
 
 void loop() {
-  switch (state) {
-    case WAITING_AGENT:
-      EXECUTE_EVERY_N_MS(500, state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_AVAILABLE : WAITING_AGENT;);
-      break;
-    case AGENT_AVAILABLE:
-      state = (true == create_entities()) ? AGENT_CONNECTED : WAITING_AGENT;
-      if (state == WAITING_AGENT) {
-        destroy_entities();
-      };
-      break;
-    case AGENT_CONNECTED:
-      EXECUTE_EVERY_N_MS(200, state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_CONNECTED : AGENT_DISCONNECTED;);
-      if (state == AGENT_CONNECTED) {
-        Serial.println("Executor running...");
-        rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
-        run_control_loop();
+  // This runs on Core 1 - dedicated to Serial output
+  if (millis() - lastDisplayTime >= UPDATE_INTERVAL) {
+    lastDisplayTime = millis();
+    
+    // Get data with mutex protection
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      if (sensorData.dataReady) {
+        displaySensorData();
       }
-      break;
-    case AGENT_DISCONNECTED:
-      destroy_entities();
-      state = WAITING_AGENT;
-      break;
-    default:
-      break;
+      xSemaphoreGive(dataMutex);
+    }
   }
+  
+  vTaskDelay(pdMS_TO_TICKS(100));
+}
 
-  // if(state == AGENT_CONNECTED) {
-  //   run_control_loop();
-  // }
+// Task running on Core 0 - dedicated to I2C sensor reading
+void sensorReadTask(void *parameter) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xFrequency = pdMS_TO_TICKS(500);  // Read every 500ms (slower but more reliable)
+  
+  while (true) {
+    // Read WSEN-PADS
+    uint8_t pads_status = PADS_readRegister(PADS_STATUS_REG);
+    
+    float pressure = 0.0;
+    float tempPADS = 0.0;
+    
+    if (pads_status & 0x01) {
+      int32_t pressure_raw = PADS_readPressure();
+      if (pressure_raw != 0) {
+        pressure = (pressure_raw / 40960.0) * 10.0;
+      }
+    }
+    
+    if (pads_status & 0x02) {
+      int16_t temp_raw = PADS_readTemperature();
+      tempPADS = temp_raw / 100.0;
+    }
+    
+    // Read WSEN-HIDS (blocking mode for reliability)
+    float tempHIDS = 0.0;
+    float humidity = 0.0;
+    bool hidsValid = HIDS_measureBlocking(&tempHIDS, &humidity);
+    
+    // Only update if HIDS reading is valid
+    if (!hidsValid) {
+      // Retry once if failed
+      vTaskDelay(pdMS_TO_TICKS(50));
+      hidsValid = HIDS_measureBlocking(&tempHIDS, &humidity);
+    }
+    
+    // Read INA226 sensors
+    float v1 = ina1.getBusVoltage();  // Calibration offset
+    float i1 = ina1.getCurrent();
+    float p1 = ina1.getPower();
+    
+    float v2 = ina2.getBusVoltage();
+    float i2 = ina2.getCurrent();
+    float p2 = ina2.getPower();
+    
+    // Calculate fusion temperature only if both sensors are valid
+    float tempFusion = 0.0;
+    if (hidsValid && tempPADS != 0.0) {
+      tempFusion = (tempHIDS + tempPADS) / 2.0;
+    } else if (hidsValid) {
+      tempFusion = tempHIDS;
+    } else if (tempPADS != 0.0) {
+      tempFusion = tempPADS;
+    }
+    
+    // Update shared data with mutex protection
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      sensorData.pressure = pressure;
+      sensorData.tempPADS = tempPADS;
+      sensorData.tempHIDS = tempHIDS;
+      sensorData.humidity = humidity;
+      sensorData.tempFusion = tempFusion;
+      sensorData.voltage1 = v1;
+      sensorData.current1 = i1;
+      sensorData.power1 = p1;
+      sensorData.voltage2 = v2;
+      sensorData.current2 = i2;
+      sensorData.power2 = p2;
+      sensorData.timestamp = millis();
+      sensorData.dataReady = true;
+      sensorData.hidsValid = hidsValid;
+      
+      xSemaphoreGive(dataMutex);
+    }
+    
+    // Wait for next cycle
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+  }
+}
+
+void displaySensorData() {
+  #if DISPLAY_WITH_LABELS
+    Serial.println(F("┌─────────────────────────────────────┐"));
+    Serial.printf("│ Time: %.1f s", sensorData.timestamp / 1000.0);
+    if (!sensorData.hidsValid) {
+      Serial.print(F(" [HIDS: ✗]"));
+    }
+    Serial.println();
+    
+    Serial.println(F("├─────────────────────────────────────┤"));
+    Serial.printf("│ Pressure:      %.2f hPa\n", sensorData.pressure);
+    
+    Serial.println(F("├─────────────────────────────────────┤"));
+    
+    if (sensorData.hidsValid) {
+      Serial.printf("│ Temp (HIDS):   %.2f °C ✓\n", sensorData.tempHIDS);
+    } else {
+      Serial.println(F("│ Temp (HIDS):   -- °C (No Data)"));
+    }
+    
+    Serial.printf("│ Temp (PADS):   %.2f °C\n", sensorData.tempPADS);
+    Serial.printf("│ Temp (Fusion): %.2f °C\n", sensorData.tempFusion);
+    
+    if (sensorData.hidsValid) {
+      Serial.printf("│ Humidity:      %.2f %%RH ✓\n", sensorData.humidity);
+    } else {
+      Serial.println(F("│ Humidity:      -- %RH (No Data)"));
+    }
+    
+    Serial.println(F("├─────────────────────────────────────┤"));
+    Serial.println(F("│ INA226 #1 (0x45)                   │"));
+    Serial.printf("│   Voltage:     %.3f V\n", sensorData.voltage1);  // Calibration offset
+    Serial.printf("│   Current:     %.2f mA\n", sensorData.current1 * 1000);
+    Serial.printf("│   Power:       %.3f W\n", sensorData.power1);
+    
+    Serial.println(F("├─────────────────────────────────────┤"));
+    Serial.println(F("│ INA226 #2 (0x41)                   │"));
+    Serial.printf("│   Voltage:     %.3f V\n", sensorData.voltage2);
+    Serial.printf("│   Current:     %.2f mA\n", sensorData.current2 * 1000);
+    Serial.printf("│   Power:       %.3f W\n", sensorData.power2);
+    Serial.println(F("└─────────────────────────────────────┘\n"));
+    
+  #else
+    // CSV format
+    Serial.printf("%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n",
+                  sensorData.timestamp,
+                  sensorData.pressure,
+                  sensorData.tempHIDS,
+                  sensorData.tempPADS,
+                  sensorData.tempFusion,
+                  sensorData.humidity,
+                  sensorData.voltage1,
+                  sensorData.current1,
+                  sensorData.power1,
+                  sensorData.voltage2,
+                  sensorData.current2,
+                  sensorData.power2,
+                  sensorData.hidsValid ? 1 : 0);  // HIDS status flag
+  #endif
+}
+
+// ========== WSEN-PADS Functions ==========
+bool PADS_init() {
+  uint8_t deviceID = PADS_readRegister(PADS_DEVICE_ID_REG);
+  if (deviceID != PADS_DEVICE_ID_VALUE) return false;
+  
+  PADS_writeRegister(PADS_CTRL_1_REG, 0x30);
+  PADS_writeRegister(PADS_CTRL_2_REG, 0x12);
+  delay(50);
+  
+  return true;
+}
+
+uint8_t PADS_readRegister(uint8_t reg) {
+  Wire.beginTransmission(PADS_ADDRESS);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return 0;
+  
+  Wire.requestFrom((uint8_t)PADS_ADDRESS, (uint8_t)1);
+  if (Wire.available()) {
+    return Wire.read();
+  }
+  return 0;
+}
+
+void PADS_writeRegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(PADS_ADDRESS);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
+}
+
+int32_t PADS_readPressure() {
+  Wire.beginTransmission(PADS_ADDRESS);
+  Wire.write(PADS_DATA_P_XL_REG);
+  if (Wire.endTransmission(false) != 0) return 0;
+  
+  Wire.requestFrom((uint8_t)PADS_ADDRESS, (uint8_t)3);
+  
+  if (Wire.available() >= 3) {
+    uint8_t xl = Wire.read();
+    uint8_t l = Wire.read();
+    uint8_t h = Wire.read();
+    
+    int32_t pressure = ((int32_t)h << 24) | ((int32_t)l << 16) | ((int32_t)xl << 8);
+    pressure /= 256;
+    return pressure;
+  }
+  return 0;
+}
+
+int16_t PADS_readTemperature() {
+  Wire.beginTransmission(PADS_ADDRESS);
+  Wire.write(PADS_DATA_T_L_REG);
+  if (Wire.endTransmission(false) != 0) return 0;
+  
+  Wire.requestFrom((uint8_t)PADS_ADDRESS, (uint8_t)2);
+  
+  if (Wire.available() >= 2) {
+    uint8_t l = Wire.read();
+    uint8_t h = Wire.read();
+    return ((int16_t)h << 8) | l;
+  }
+  return 0;
+}
+
+// ========== WSEN-HIDS Functions ==========
+uint8_t calculateCRC8(uint8_t *data, uint8_t len) {
+  uint8_t crc = CRC8_INIT;
+  for (uint8_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (uint8_t j = 0; j < 8; j++) {
+      crc = (crc & 0x80) ? ((crc << 1) ^ CRC8_POLYNOMIAL) : (crc << 1);
+    }
+  }
+  return crc;
+}
+
+bool verifyCRC8(uint8_t *data, uint8_t len, uint8_t crc) {
+  return (calculateCRC8(data, len) == crc);
+}
+
+bool HIDS_sendCommand(uint8_t command) {
+  Wire.beginTransmission(HIDS_ADDRESS);
+  Wire.write(command);
+  return (Wire.endTransmission() == 0);
+}
+
+bool HIDS_readData(uint8_t *data, uint8_t len) {
+  uint8_t received = Wire.requestFrom((uint8_t)HIDS_ADDRESS, len);
+  if (received != len) return false;
+  
+  for (uint8_t i = 0; i < len; i++) {
+    if (Wire.available()) {
+      data[i] = Wire.read();
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool HIDS_init() {
+  return HIDS_softReset();
+}
+
+bool HIDS_softReset() {
+  if (!HIDS_sendCommand(HIDS_SOFT_RESET)) return false;
+  delay(2);
+  return true;
+}
+
+bool HIDS_readSerialNumber(uint32_t *serialNumber) {
+  uint8_t data[6];
+  
+  if (!HIDS_sendCommand(HIDS_MEASURE_SERIAL_NUMBER)) return false;
+  delay(1);
+  
+  if (!HIDS_readData(data, 6)) return false;
+  
+  if (!verifyCRC8(&data[0], 2, data[2])) return false;
+  if (!verifyCRC8(&data[3], 2, data[5])) return false;
+  
+  *serialNumber = ((uint32_t)data[0] << 24) | 
+                  ((uint32_t)data[1] << 16) | 
+                  ((uint32_t)data[3] << 8) | 
+                  ((uint32_t)data[4]);
+  
+  return true;
+}
+
+// Changed to BLOCKING for reliability
+bool HIDS_measureBlocking(float *temperature, float *humidity) {
+  uint8_t data[6];
+  
+  // Send measurement command
+  if (!HIDS_sendCommand(HIDS_MEASURE_HPM)) return false;
+  
+  // Wait for conversion to complete
+  delay(HIDS_MEASURE_DELAY_HPM);
+  
+  // Read data
+  if (!HIDS_readData(data, 6)) return false;
+  
+  // Verify CRC
+  if (!verifyCRC8(&data[0], 2, data[2])) return false;
+  if (!verifyCRC8(&data[3], 2, data[5])) return false;
+  
+  // Parse temperature
+  uint16_t tempRaw = (data[0] << 8) | data[1];
+  *temperature = -45.0 + 175.0 * ((float)tempRaw / 65535.0);
+  
+  // Parse humidity
+  uint16_t humRaw = (data[3] << 8) | data[4];
+  *humidity = 100.0 * ((float)humRaw / 65535.0);
+  
+  // Constrain humidity
+  if (*humidity < 0) *humidity = 0;
+  if (*humidity > 100) *humidity = 100;
+  
+  // Validate readings (sanity check)
+  if (*temperature < -40.0 || *temperature > 125.0) return false;
+  
+  return true;
 }
