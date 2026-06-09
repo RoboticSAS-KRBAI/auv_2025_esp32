@@ -38,7 +38,7 @@
 #define INA2_ADDR 0x41
 
 // Display Configuration
-#define DISPLAY_WITH_LABELS true
+#define DISPLAY_WITH_LABELS false
 #define UPDATE_INTERVAL 2000
 #define I2C_TIMEOUT 100
 #define SERIAL_BUFFER_SIZE 512
@@ -104,11 +104,14 @@ void setup() {
   Serial.println(F("║  Multi-Sensor ESP32-S3 (HIDS Fixed)   ║"));
   Serial.println(F("╚════════════════════════════════════════╝"));
   
+  delay(500);
+  
   // Initialize I2C with timeout
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(100000);  // Reduced to 100kHz for better stability
   Wire.setTimeOut(I2C_TIMEOUT);
   delay(100);
+
   
   // Create mutex
   dataMutex = xSemaphoreCreateMutex();
@@ -157,7 +160,6 @@ void setup() {
   // Initialize sensor data
   sensorData.dataReady = false;
   sensorData.hidsValid = false;
-  
   // Create sensor reading task on Core 0
   xTaskCreatePinnedToCore(
     sensorReadTask,
@@ -173,7 +175,6 @@ void setup() {
 }
 
 void loop() {
-  // This runs on Core 1 - dedicated to Serial output
   if (millis() - lastDisplayTime >= UPDATE_INTERVAL) {
     lastDisplayTime = millis();
     
@@ -494,3 +495,4 @@ bool HIDS_measureBlocking(float *temperature, float *humidity) {
   
   return true;
 }
+// 
